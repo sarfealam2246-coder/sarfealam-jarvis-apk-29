@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract & Patch Native Android Voice
+      - name: Extract & Patch Native Android Voice + NVIDIA Model
         run: |
           unzip -o "*.zip"
           node - << 'EOF'
@@ -34,6 +34,10 @@ jobs:
           ve = ve.replace("    if (SpeechRecCtor) {", "    if (Capacitor.isNativePlatform()) {\n      try {\n        const av = await NativeSpeech.available();\n        if (av.available) {\n          await NativeSpeech.requestPermissions();\n          this.usingNativeStt = true;\n          this.usingWhisperFallback = false;\n          this.callbacks.onStateChange('listening');\n          await NativeSpeech.removeAllListeners();\n          await NativeSpeech.addListener('partialResults', (d: any) => {\n            if (!this.active || this.isSpeaking || Date.now() < this.speakingGuardUntil) return;\n            const t = (d.matches?.[0] || '').trim();\n            if (!t) return;\n            this.pendingTranscript = t;\n            this.callbacks.onTranscriptInterim(t);\n            if (this.vadTimer) window.clearTimeout(this.vadTimer);\n            this.vadTimer = window.setTimeout(() => {\n              const s = this.pendingTranscript.trim();\n              if (s.length > 1 && !this.isSpeaking) { this.pendingTranscript = ''; this.callbacks.onTranscriptInterim(''); this.callbacks.onTranscriptFinal(s); }\n            }, 850);\n          });\n          await NativeSpeech.addListener('listeningState', (st: any) => {\n            if (st.status === 'stopped' && this.active && this.usingNativeStt && !this.isSpeaking) {\n              setTimeout(() => { if (this.active && this.usingNativeStt && !this.isSpeaking) NativeSpeech.start({ language: this.lang === 'hi' ? 'hi-IN' : 'en-IN', maxResults: 1, partialResults: true, popup: false }).catch(() => {}); }, 300);\n            }\n          });\n          await NativeSpeech.start({ language: this.lang === 'hi' ? 'hi-IN' : 'en-IN', maxResults: 1, partialResults: true, popup: false });\n          return;\n        }\n      } catch { this.usingNativeStt = false; }\n    }\n    if (SpeechRecCtor) {");
           ve = ve.replace("    this.usingWhisperFallback = false;", "    this.usingWhisperFallback = false;\n    if (this.usingNativeStt) { this.usingNativeStt = false; NativeSpeech.stop().catch(() => {}); NativeSpeech.removeAllListeners().catch(() => {}); }");
           fs.writeFileSync('src/services/voiceEngine.ts', ve);
+
+          let ar = fs.readFileSync('src/services/aiRouter.ts', 'utf8');
+          ar = ar.replaceAll('nvidia/llama-3.3-nemotron-super-49b-v1', 'meta/llama-3.3-70b-instruct');
+          fs.writeFileSync('src/services/aiRouter.ts', ar);
           EOF
 
       - uses: actions/setup-node@v4
@@ -56,8 +60,8 @@ jobs:
           if ! grep -q "RECORD_AUDIO" "$MANIFEST"; then
             sed -i 's|<uses-permission android:name="android.permission.INTERNET" />|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />|' "$MANIFEST"
           fi
-          if ! grep -q "RecognitionService" "$MANIFEST"; then
-            sed -i 's|</manifest>|    <queries>\n        <intent>\n            <action android:name="android.speech.RecognitionService" />\n        </intent>\n    </queries>\n</manifest>|' "$MANIFEST"
+          if ! grep -q "TTS_SERVICE" "$MANIFEST"; then
+            sed -i 's|</manifest>|    <queries>\n        <intent>\n            <action android:name="android.speech.RecognitionService" />\n        </intent>\n        <intent>\n            <action android:name="android.intent.action.TTS_SERVICE" />\n        </intent>\n    </queries>\n</manifest>|' "$MANIFEST"
           fi
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
           cd android && chmod +x gradlew && ./gradlew assembleDebug
@@ -69,7 +73,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v3.2-${{ github.run_number }}
+          tag_name: v3.3-${{ github.run_number }}
           name: Sarfealam JARVIS Studio APK #${{ github.run_number }}
           files: android/app/build/outputs/apk/debug/app-debug.apk
         env:
