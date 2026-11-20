@@ -14,8 +14,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract Studio ZIP
-        run: unzip -o "*.zip"
+      - name: Extract & Patch Native Android Voice
+        run: |
+          unzip -o "*.zip"
+          node - << 'EOF'
+          const fs = require('fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          pkg.dependencies['@capacitor/core'] = '^6.2.0';
+          pkg.dependencies['@capacitor-community/text-to-speech'] = '^6.0.0';
+          pkg.dependencies['@capacitor-community/speech-recognition'] = '^6.0.0';
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+
+          let ve = fs.readFileSync('src/services/voiceEngine.ts', 'utf8');
+          ve = "import { Capacitor } from '@capacitor/core';\nimport { TextToSpeech } from '@capacitor-community/text-to-speech';\nimport { SpeechRecognition as NativeSpeech } from '@capacitor-community/speech-recognition';\n" + ve;
+          ve = ve.replace("private usingWhisperFallback = false;", "private usingWhisperFallback = false;\n  private usingNativeStt = false;");
+          ve = ve.replace("    try {\n      window.speechSynthesis?.cancel();\n    } catch {", "    if (Capacitor.isNativePlatform()) { TextToSpeech.stop().catch(() => {}); }\n    try {\n      window.speechSynthesis?.cancel();\n    } catch {");
+          ve = ve.replace("  private pumpTtsQueue() {\n    if (!('speechSynthesis' in window) || this.ttsQueue.length === 0) {", "  private pumpTtsQueue() {\n    if (this.ttsQueue.length === 0) {");
+          ve = ve.replace("    try {\n      window.speechSynthesis.speak(utter);\n    } catch {\n      this.isSpeaking = false;\n    }", "    if (Capacitor.isNativePlatform()) {\n      TextToSpeech.speak({ text: next, lang: targetLang, rate: this.lang === 'hi' ? 1.0 : 1.05, pitch: 1.0, volume: 1.0, category: 'ambient' }).then(() => this.pumpTtsQueue()).catch(() => { this.isSpeaking = false; this.pumpTtsQueue(); });\n      return;\n    }\n    if (!('speechSynthesis' in window)) { this.isSpeaking = false; this.pumpTtsQueue(); return; }\n    try {\n      window.speechSynthesis.speak(utter);\n    } catch {\n      this.isSpeaking = false;\n    }");
+          ve = ve.replace("    if (SpeechRecCtor) {", "    if (Capacitor.isNativePlatform()) {\n      try {\n        const av = await NativeSpeech.available();\n        if (av.available) {\n          await NativeSpeech.requestPermissions();\n          this.usingNativeStt = true;\n          this.usingWhisperFallback = false;\n          this.callbacks.onStateChange('listening');\n          await NativeSpeech.removeAllListeners();\n          await NativeSpeech.addListener('partialResults', (d: any) => {\n            if (!this.active || this.isSpeaking || Date.now() < this.speakingGuardUntil) return;\n            const t = (d.matches?.[0] || '').trim();\n            if (!t) return;\n            this.pendingTranscript = t;\n            this.callbacks.onTranscriptInterim(t);\n            if (this.vadTimer) window.clearTimeout(this.vadTimer);\n            this.vadTimer = window.setTimeout(() => {\n              const s = this.pendingTranscript.trim();\n              if (s.length > 1 && !this.isSpeaking) { this.pendingTranscript = ''; this.callbacks.onTranscriptInterim(''); this.callbacks.onTranscriptFinal(s); }\n            }, 850);\n          });\n          await NativeSpeech.addListener('listeningState', (st: any) => {\n            if (st.status === 'stopped' && this.active && this.usingNativeStt && !this.isSpeaking) {\n              setTimeout(() => { if (this.active && this.usingNativeStt && !this.isSpeaking) NativeSpeech.start({ language: this.lang === 'hi' ? 'hi-IN' : 'en-IN', maxResults: 1, partialResults: true, popup: false }).catch(() => {}); }, 300);\n            }\n          });\n          await NativeSpeech.start({ language: this.lang === 'hi' ? 'hi-IN' : 'en-IN', maxResults: 1, partialResults: true, popup: false });\n          return;\n        }\n      } catch { this.usingNativeStt = false; }\n    }\n    if (SpeechRecCtor) {");
+          ve = ve.replace("    this.usingWhisperFallback = false;", "    this.usingWhisperFallback = false;\n    if (this.usingNativeStt) { this.usingNativeStt = false; NativeSpeech.stop().catch(() => {}); NativeSpeech.removeAllListeners().catch(() => {}); }");
+          fs.writeFileSync('src/services/voiceEngine.ts', ve);
+          EOF
 
       - uses: actions/setup-node@v4
         with:
@@ -26,16 +45,19 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
-      - name: Build Web, Add Mic Permission & Android APK
+      - name: Build Web, Native Voice & Android APK
         run: |
           npm install --legacy-peer-deps
           npm run build
-          npm install --legacy-peer-deps @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          npm install --legacy-peer-deps @capacitor/cli@6 @capacitor/android@6
           npx cap add android || true
           npx cap sync android
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if ! grep -q "RECORD_AUDIO" "$MANIFEST"; then
             sed -i 's|<uses-permission android:name="android.permission.INTERNET" />|<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />|' "$MANIFEST"
+          fi
+          if ! grep -q "RecognitionService" "$MANIFEST"; then
+            sed -i 's|</manifest>|    <queries>\n        <intent>\n            <action android:name="android.speech.RecognitionService" />\n        </intent>\n    </queries>\n</manifest>|' "$MANIFEST"
           fi
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
           cd android && chmod +x gradlew && ./gradlew assembleDebug
@@ -47,7 +69,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v3.0-${{ github.run_number }}
+          tag_name: v3.2-${{ github.run_number }}
           name: Sarfealam JARVIS Studio APK #${{ github.run_number }}
           files: android/app/build/outputs/apk/debug/app-debug.apk
         env:
